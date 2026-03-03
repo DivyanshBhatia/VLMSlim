@@ -15,10 +15,11 @@ import os
 @dataclass
 class TeacherConfig:
     name: str
-    model_type: str          # "clip", "siglip", "openclip", "deit", "resnet50"
+    model_type: str          # "clip", "openclip", "deit", "resnet50"
     checkpoint: str          # HuggingFace or OpenCLIP checkpoint string
     feature_dim: int         # Output feature dimension
     is_vlm: bool = True      # False for vision-only baselines
+    requires_finetune: bool = False  # True = must fine-tune on target dataset before caching
 
 
 # ──────────────────────────────────────────────────────────
@@ -26,33 +27,49 @@ class TeacherConfig:
 # ──────────────────────────────────────────────────────────
 
 TEACHERS = {
+    # ── VLM teachers (zero-shot capable, no fine-tuning needed) ──
     "clip_vitb16": TeacherConfig(
         name="clip_vitb16", model_type="clip",
         checkpoint="ViT-B-16/openai",
         feature_dim=512, is_vlm=True,
-    ),
-    "siglip_vitb16": TeacherConfig(
-        name="siglip_vitb16", model_type="siglip",
-        checkpoint="google/siglip-base-patch16-224",
-        feature_dim=768, is_vlm=True,
     ),
     "openclip_vitl14": TeacherConfig(
         name="openclip_vitl14", model_type="openclip",
         checkpoint="ViT-L-14/laion2b_s32b_b82k",
         feature_dim=768, is_vlm=True,
     ),
-    # Vision-only baselines for Exp 0
+    # MetaCLIP replaces SigLIP (SigLIP scored 21% zero-shot on CIFAR-100 — too weak)
+    "metaclip_vitb16": TeacherConfig(
+        name="metaclip_vitb16", model_type="openclip",
+        checkpoint="ViT-B-16-quickgelu/metaclip_400m",
+        feature_dim=512, is_vlm=True,
+    ),
+    # Keep SigLIP available but not in defaults — may work better on other datasets
+    "siglip_vitb16": TeacherConfig(
+        name="siglip_vitb16", model_type="siglip",
+        checkpoint="google/siglip-base-patch16-224",
+        feature_dim=768, is_vlm=True,
+    ),
+
+    # ── Vision-only baselines for Exp 0 ──
+    # These MUST be fine-tuned on the target dataset before caching.
+    # Run: python finetune_teacher.py --teacher deit_vitb16 --dataset cifar100
     "deit_vitb16": TeacherConfig(
         name="deit_vitb16", model_type="deit",
         checkpoint="facebook/deit-base-patch16-224",
         feature_dim=768, is_vlm=False,
+        requires_finetune=True,
     ),
     "resnet50_supervised": TeacherConfig(
         name="resnet50_supervised", model_type="resnet50",
         checkpoint="torchvision",
         feature_dim=2048, is_vlm=False,
+        requires_finetune=True,
     ),
 }
+
+# Default VLM teacher set (used in Exp 1–6)
+DEFAULT_VLM_TEACHERS = ["openclip_vitl14", "metaclip_vitb16", "clip_vitb16"]
 
 
 @dataclass
@@ -116,7 +133,7 @@ class ExperimentConfig:
 
     # ── Teachers (ordered best → worst by zero-shot score) ──
     teachers: List[str] = field(default_factory=lambda: [
-        "openclip_vitl14", "siglip_vitb16", "clip_vitb16"
+        "openclip_vitl14", "metaclip_vitb16", "clip_vitb16"
     ])
 
     # ── Fixed hyperparameters (NOT tuned) ──
@@ -213,7 +230,7 @@ def exp1_concurrent(seed: int = 42) -> ExperimentConfig:
         seed=seed,
         dataset="cifar100",
         student="resnet18",
-        teachers=["openclip_vitl14", "siglip_vitb16", "clip_vitb16"],
+        teachers=["openclip_vitl14", "metaclip_vitb16", "clip_vitb16"],
         use_cumulative_targets=False,  # Static average, not cumulative
         use_anchor=False,
         use_feature_path=True,
@@ -230,7 +247,7 @@ def exp2_naive_sequential(seed: int = 42) -> ExperimentConfig:
         seed=seed,
         dataset="cifar100",
         student="resnet18",
-        teachers=["openclip_vitl14", "siglip_vitb16", "clip_vitb16"],
+        teachers=["openclip_vitl14", "metaclip_vitb16", "clip_vitb16"],
         use_cumulative_targets=False,
         use_anchor=False,
         use_feature_path=True,
@@ -247,7 +264,7 @@ def exp3_vlmslim(seed: int = 42, lam: float = 0.1) -> ExperimentConfig:
         seed=seed,
         dataset="cifar100",
         student="resnet18",
-        teachers=["openclip_vitl14", "siglip_vitb16", "clip_vitb16"],
+        teachers=["openclip_vitl14", "metaclip_vitb16", "clip_vitb16"],
         use_cumulative_targets=True,
         use_anchor=True,
         use_feature_path=True,
@@ -295,7 +312,7 @@ def exp4_ablation(variant: str, seed: int = 42) -> ExperimentConfig:
         ),
     }
     v = configs[variant]
-    teachers = v.pop("teachers", ["openclip_vitl14", "siglip_vitb16", "clip_vitb16"])
+    teachers = v.pop("teachers", ["openclip_vitl14", "metaclip_vitb16", "clip_vitb16"])
     return ExperimentConfig(
         exp_name=f"Ablation: {variant}",
         exp_id=f"exp4_{variant}",
