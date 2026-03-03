@@ -203,15 +203,21 @@ def run_experiment(cfg: ExperimentConfig):
     print(f"{'='*70}\n")
 
     # ── 1. Load teacher scores and order ──
-    teacher_scores = load_teacher_scores(cfg.cache_dir, cfg.dataset, cfg.teachers)
-    teacher_order = order_teachers_by_score(teacher_scores)
+    is_scratch = len(cfg.teachers) == 0
+    teacher_scores = {} if is_scratch else load_teacher_scores(
+        cfg.cache_dir, cfg.dataset, cfg.teachers
+    )
+    teacher_order = [] if is_scratch else order_teachers_by_score(teacher_scores)
 
-    print(f"  Teacher scores (zero-shot on {cfg.dataset}):")
-    for t in teacher_order:
-        print(f"    {t}: {teacher_scores[t]:.2f}%")
+    if is_scratch:
+        print(f"  Scratch baseline (pure CE, no teacher distillation)")
+    else:
+        print(f"  Teacher scores (zero-shot on {cfg.dataset}):")
+        for t in teacher_order:
+            print(f"    {t}: {teacher_scores[t]:.2f}%")
 
     # For non-sequential experiments, use all teachers from epoch 1
-    if not cfg.sequential:
+    if not cfg.sequential and not is_scratch:
         teacher_order = cfg.teachers  # Use original order
 
     # ── 2. Load data ──
@@ -261,6 +267,7 @@ def run_experiment(cfg: ExperimentConfig):
         beta=cfg.beta,
         tau=cfg.tau,
         lam=cfg.lam,
+        feature_weight=cfg.feature_weight,
         teacher_scores=teacher_scores,
         use_cumulative=cfg.use_cumulative_targets,
         use_anchor=cfg.use_anchor,
@@ -268,7 +275,16 @@ def run_experiment(cfg: ExperimentConfig):
     )
 
     # ── 7. Phase schedule ──
-    if cfg.sequential:
+    if is_scratch:
+        # Scratch baseline: no phases, no teachers
+        phases = [{
+            "teacher": None,
+            "start_epoch": 0,
+            "end_epoch": ds_cfg.total_epochs,
+            "phase_idx": 0,
+        }]
+        print(f"\n  Scratch mode: pure CE training, no teacher phases")
+    elif cfg.sequential:
         phase_boundaries = cfg.get_phase_boundaries()
         # Phase i runs from boundary[i-1]+1 to boundary[i]
         # Phase 0 starts at epoch 0
@@ -324,7 +340,7 @@ def run_experiment(cfg: ExperimentConfig):
     best_val_acc = 0.0
     best_epoch = 0
     current_phase_idx = -1
-    active_teacher = teacher_order[0] if cfg.sequential else teacher_order[0]
+    active_teacher = teacher_order[0] if teacher_order else None
 
     peak_memory = 0
     total_start_time = time.time()

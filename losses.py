@@ -1,14 +1,21 @@
 """
 VLMSlim — Loss Functions
 =========================
+Feature-centric loss architecture for distilling frozen VLMs.
+
 Total loss at phase k:
     L = α·L_CE + β·L_KD + γ·L_feat + λ·L_anchor
 
-With simplified v2 hyperparameters:
-    α = 0.1  [FIXED]
-    β = 0.9  [FIXED]
+Design principle:
+    Frozen VLM teachers have weak zero-shot logits but rich feature geometry.
+    Feature alignment is the PRIMARY distillation channel.
+    KD logits serve as a lightweight regularizer.
+
+    α = 0.3  [FIXED] — CE weight (ground truth is more reliable than weak teachers)
+    β = 0.2  [FIXED] — KD weight (demoted to regularizer; 62-73% logits are noisy)
     τ = 4.0  [FIXED]
-    γ = auto [DERIVED at epoch 1]
+    γ = auto [DERIVED] — scaled so features capture ~50% of gradient budget
+             γ = feature_weight × mean_CE / mean_feat (at epoch 1)
     λ        [TUNED — only tuned hyperparameter]
 """
 
@@ -148,10 +155,11 @@ class VLMSlimLoss(nn.Module):
 
     def __init__(
         self,
-        alpha: float = 0.1,
-        beta: float = 0.9,
+        alpha: float = 0.3,
+        beta: float = 0.2,
         tau: float = 4.0,
         lam: float = 0.1,
+        feature_weight: float = 0.5,
         teacher_scores: Dict[str, float] = None,
         use_cumulative: bool = True,
         use_anchor: bool = True,
@@ -162,6 +170,7 @@ class VLMSlimLoss(nn.Module):
         self.beta = beta
         self.tau = tau
         self.lam = lam
+        self.feature_weight = feature_weight
         self.use_cumulative = use_cumulative
         self.use_anchor = use_anchor
         self.use_feature = use_feature
@@ -176,8 +185,11 @@ class VLMSlimLoss(nn.Module):
         self.target_builder = CumulativeTargetBuilder(teacher_scores or {}, tau=tau)
 
         # γ auto-derivation state
+        # Derives γ so feature alignment captures ~feature_weight fraction
+        # of the gradient budget. Uses CE as reference (not KD), because
+        # CE is the reliable signal and features should scale relative to it.
         self.gamma = None               # None = not yet derived
-        self._gamma_kd_accum = []
+        self._gamma_ce_accum = []
         self._gamma_feat_accum = []
         self._gamma_calibration_batches = 100
         self._gamma_calibrated = False
@@ -195,21 +207,35 @@ class VLMSlimLoss(nn.Module):
             print(f"  [Anchor] Snapshot taken at phase {phase_idx} boundary")
 
     def derive_gamma(self) -> float:
-        """Derive γ from accumulated loss magnitudes. Called after calibration batches."""
-        if not self._gamma_kd_accum or not self._gamma_feat_accum:
-            print("  [γ] Warning: no calibration data, defaulting to γ=50.0")
-            return 50.0
+        """Derive γ from accumulated loss magnitudes.
 
-        mean_kd = sum(self._gamma_kd_accum) / len(self._gamma_kd_accum)
+        Feature-centric derivation:
+            γ = feature_weight × mean_CE / mean_feat
+
+        This scales the raw feature loss to CE magnitude, then applies
+        feature_weight (default 0.5) so features capture ~50% of the
+        total gradient budget at epoch 1.
+
+        With α=0.3, β=0.2, feature_weight=0.5, typical CIFAR-100 values:
+            mean_CE ≈ 4.7, mean_feat ≈ 0.17
+            γ ≈ 0.5 × 4.7 / 0.17 ≈ 13.8
+            Budget: CE ~34%, Features ~56%, KD ~10%
+        """
+        if not self._gamma_ce_accum or not self._gamma_feat_accum:
+            print("  [γ] Warning: no calibration data, defaulting to γ=15.0")
+            return 15.0
+
+        mean_ce = sum(self._gamma_ce_accum) / len(self._gamma_ce_accum)
         mean_feat = sum(self._gamma_feat_accum) / len(self._gamma_feat_accum)
 
         if mean_feat < 1e-8:
-            print("  [γ] Warning: feature loss near zero, defaulting to γ=50.0")
-            return 50.0
+            print("  [γ] Warning: feature loss near zero, defaulting to γ=15.0")
+            return 15.0
 
-        gamma = mean_kd / mean_feat
+        gamma = self.feature_weight * mean_ce / mean_feat
         print(f"  [γ] Derived: γ = {gamma:.4f} "
-              f"(mean_KD={mean_kd:.6f}, mean_feat={mean_feat:.6f})")
+              f"(feature_weight={self.feature_weight}, "
+              f"mean_CE={mean_ce:.6f}, mean_feat={mean_feat:.6f})")
         return gamma
 
     def forward(
@@ -250,18 +276,18 @@ class VLMSlimLoss(nn.Module):
             l_feat = self.feat_loss(student_features, projected_teacher_features)
             losses["feat"] = l_feat
 
-            # γ calibration: accumulate during first 100 batches
+            # γ calibration: accumulate CE and feat during first 100 batches
             if not self._gamma_calibrated:
-                self._gamma_kd_accum.append(l_kd.item())
+                self._gamma_ce_accum.append(l_ce.item())
                 self._gamma_feat_accum.append(l_feat.item())
-                if len(self._gamma_kd_accum) >= self._gamma_calibration_batches:
+                if len(self._gamma_ce_accum) >= self._gamma_calibration_batches:
                     self.gamma = self.derive_gamma()
                     self._gamma_calibrated = True
         else:
             losses["feat"] = l_feat
 
-        # Use gamma (default to 50 if not yet calibrated)
-        gamma = self.gamma if self.gamma is not None else 50.0
+        # Use gamma (default to 15 if not yet calibrated)
+        gamma = self.gamma if self.gamma is not None else 15.0
 
         # ── 4. Anchor loss ──
         l_anchor = torch.tensor(0.0, device=device)

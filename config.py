@@ -1,10 +1,26 @@
 """
 VLMSlim Experiment Configurations
 =================================
-All hyperparameters follow the simplified v2 design:
-  - 1 tuned parameter: λ (anchor strength)
-  - 4 fixed/derived: α=0.1, β=0.9, τ=4.0, γ=auto
-  - Phase boundaries: equal split (total_epochs / K)
+Feature-centric multi-teacher distillation from frozen VLMs.
+
+Loss architecture (v3):
+    L = α·L_CE + β·L_KD + γ·L_feat + λ·L_anchor
+
+Design principle: frozen VLM teachers have weak zero-shot logits (62-73%
+on CIFAR-100) but geometrically rich feature spaces shaped by language
+supervision. Therefore:
+    - Feature alignment is the PRIMARY distillation channel
+    - KD logits are a lightweight regularizer, not the main signal
+    - CE gets more weight since ground-truth labels are more reliable
+      than 62%-accurate soft targets
+
+Hyperparameters:
+    α = 0.3   [FIXED] — CE weight (up from 0.1; ground truth is more reliable)
+    β = 0.2   [FIXED] — KD weight (down from 0.9; noisy logits demoted to regularizer)
+    τ = 4.0   [FIXED] — temperature
+    γ = auto  [DERIVED] — scaled so features capture ~50% of gradient budget
+    λ         [TUNED]  — anchor strength (only tuned hyperparameter)
+    Phase boundaries: equal split (total_epochs / K)
 """
 
 from dataclasses import dataclass, field
@@ -137,9 +153,13 @@ class ExperimentConfig:
     ])
 
     # ── Fixed hyperparameters (NOT tuned) ──
-    alpha: float = 0.1          # CE weight — Hinton et al. standard
-    beta: float = 0.9           # KD weight = 1 - alpha
+    alpha: float = 0.3          # CE weight — higher than standard KD (0.1) because
+                                 # frozen VLM teachers are weaker than typical KD teachers
+    beta: float = 0.2           # KD weight — demoted from 0.9 to regularizer role;
+                                 # noisy zero-shot logits shouldn't dominate training
     tau: float = 4.0            # Temperature — standard for KD
+    feature_weight: float = 0.5 # Feature budget fraction for γ auto-derivation
+                                 # γ = feature_weight × mean_CE / mean_feat
     # gamma is derived automatically, not set here
 
     # ── Tuned hyperparameter ──
@@ -185,6 +205,8 @@ class ExperimentConfig:
         """Return epoch numbers where teacher transitions happen."""
         ds = self.get_dataset_config()
         K = len(self.teachers)
+        if K == 0:
+            return []  # Scratch baseline — no phase transitions
         if self.phase_schedule == "equal":
             phase_len = ds.total_epochs // K
             return [phase_len * (i + 1) for i in range(K - 1)]
@@ -205,10 +227,41 @@ class ExperimentConfig:
 # Pre-built experiment configs
 # ──────────────────────────────────────────────────────────
 
-def exp0_sanity(teacher_key: str, seed: int = 42) -> ExperimentConfig:
-    """Exp 0: Single teacher KD (VLM vs vision-only)."""
+def exp0_scratch(seed: int = 42) -> ExperimentConfig:
+    """Exp 0a: Scratch baseline — pure CE, no distillation.
+
+    This establishes the accuracy ceiling for ResNet-18 on CIFAR-100
+    without any teacher supervision (~77%). The VLM-distilled student
+    may not beat this on accuracy, but should produce better-structured
+    feature spaces (higher inter/intra-class distance ratio).
+    """
     return ExperimentConfig(
-        exp_name=f"Sanity Check: {teacher_key}",
+        exp_name="Scratch Baseline (CE only)",
+        exp_id="exp0_scratch",
+        seed=seed,
+        dataset="cifar100",
+        student="resnet18",
+        teachers=[],  # No teachers — handled in train.py as pure CE
+        alpha=1.0,    # Full weight on CE
+        beta=0.0,     # No KD
+        feature_weight=0.0,
+        use_cumulative_targets=False,
+        use_anchor=False,
+        use_feature_path=False,
+        sequential=False,
+        lam=0.0,
+    )
+
+
+def exp0_sanity(teacher_key: str, seed: int = 42) -> ExperimentConfig:
+    """Exp 0b: Single VLM teacher KD — tests cross-modal feature transfer.
+
+    Compared against scratch baseline on BOTH accuracy AND feature quality.
+    The gate passes if the VLM student produces a meaningfully higher
+    inter/intra-class distance ratio, even if accuracy is slightly lower.
+    """
+    return ExperimentConfig(
+        exp_name=f"VLM Distillation: {teacher_key}",
         exp_id=f"exp0_{teacher_key}",
         seed=seed,
         dataset="cifar100",
@@ -216,7 +269,7 @@ def exp0_sanity(teacher_key: str, seed: int = 42) -> ExperimentConfig:
         teachers=[teacher_key],
         use_cumulative_targets=False,
         use_anchor=False,
-        use_feature_path=TEACHERS[teacher_key].is_vlm,  # Feature path only for VLM
+        use_feature_path=True,   # Feature path is the primary channel
         sequential=False,
         lam=0.0,
     )
